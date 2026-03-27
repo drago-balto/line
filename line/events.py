@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional, Union
 import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def _generate_event_id() -> str:
@@ -117,10 +117,26 @@ class CustomHistoryEntry(BaseModel):
 # history=None indicates the event is used within a history list (no nested history).
 
 
+class CallContext(BaseModel):
+    """Telephony context for the call, available on CallStarted."""
+
+    call_id: str = ""
+    from_: str = Field(default="", alias="from")
+    to: str = ""
+    direction: Optional[str] = None
+    call_sid: Optional[str] = None
+    agent_call_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    extra: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class CallStarted(BaseModel):
     type: Literal["call_started"] = "call_started"
     event_id: str = Field(default_factory=_generate_event_id)
     history: Optional[List["InputEvent"]] = None
+    call_context: Optional[CallContext] = None
 
 
 class CallEnded(BaseModel):
@@ -248,6 +264,7 @@ __all__ = [
     # Custom
     "CustomHistoryEntry",
     # Input
+    "CallContext",
     "CallStarted",
     "CallEnded",
     "UserTurnStarted",

@@ -61,6 +61,7 @@ from line.events import (
     AgentTurnEnded,
     AgentTurnStarted,
     AgentUpdateCall,
+    CallContext,
     CallEnded,
     CallStarted,
     InputEvent,
@@ -99,6 +100,9 @@ class CallRequest(BaseModel):
     agent_call_id: str  # Agent call ID for logging and correlation
     agent: AgentConfig
     metadata: Optional[Dict[str, Any]] = None
+    direction: Optional[str] = None  # "inbound" or "outbound"
+    call_sid: Optional[str] = None  # Telephony call SID
+    extra: Dict[str, Any] = Field(default_factory=dict)  # Other top-level telephony fields
 
     model_config = ConfigDict(
         # Allow both field name (from_) and alias (from) for input
@@ -156,13 +160,29 @@ class VoiceAgentApp:
         """Create a new chat session and return the websocket URL."""
         body = await request.json()
 
+        known_keys = {
+            "call_id",
+            "from",
+            "from_",
+            "to",
+            "agent_call_id",
+            "agent",
+            "metadata",
+            "direction",
+            "call_sid",
+        }
+        extra = {k: v for k, v in body.items() if k not in known_keys}
+
         call_request = CallRequest(
             call_id=body.get("call_id", "unknown"),
-            from_=body.get("from_", "unknown"),
+            from_=body.get("from_", body.get("from", "unknown")),
             to=body.get("to", "unknown"),
             agent_call_id=body.get("agent_call_id", body.get("call_id", "unknown")),
             agent=AgentConfig(**body.get("agent", {})),
             metadata=body.get("metadata", {}),
+            direction=body.get("direction"),
+            call_sid=body.get("call_sid"),
+            extra=extra,
         )
 
         config = None
@@ -188,6 +208,9 @@ class VoiceAgentApp:
             "agent_call_id": call_request.agent_call_id,
             "agent": json.dumps(call_request.agent.model_dump()),
             "metadata": json.dumps(call_request.metadata),
+            "direction": call_request.direction or "",
+            "call_sid": call_request.call_sid or "",
+            "extra": json.dumps(call_request.extra),
         }
 
         query_string = urlencode(url_params)
@@ -230,6 +253,14 @@ class VoiceAgentApp:
                 logger.warning(f"Invalid agent JSON: {query_params['agent']}")
                 agent_data = {}
 
+        extra_data = {}
+        if "extra" in query_params:
+            try:
+                extra_data = json.loads(query_params["extra"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(f"Invalid extra JSON: {query_params['extra']}")
+                extra_data = {}
+
         call_request = CallRequest(
             call_id=query_params.get("call_id", "unknown"),
             from_=query_params.get("from", "unknown"),
@@ -237,6 +268,9 @@ class VoiceAgentApp:
             agent_call_id=query_params.get("agent_call_id", "unknown"),
             agent=AgentConfig(**agent_data),
             metadata=metadata,
+            direction=query_params.get("direction") or None,
+            call_sid=query_params.get("call_sid") or None,
+            extra=extra_data,
         )
 
         runner: Optional[ConversationRunner] = None
@@ -245,7 +279,7 @@ class VoiceAgentApp:
         env = AgentEnv(loop)
         try:
             agent_spec = await self.get_agent(env, call_request)
-            runner = ConversationRunner(websocket, agent_spec, env)
+            runner = ConversationRunner(websocket, agent_spec, env, call_request)
         except Exception:
             error_msg = traceback.format_exc()
             error_string = f"Error in get_agent for {call_request.call_id}: {error_msg}"
@@ -272,7 +306,13 @@ class ConversationRunner:
     the websocket.
     """
 
-    def __init__(self, websocket: WebSocket, agent_spec: AgentSpec, env: AgentEnv):
+    def __init__(
+        self,
+        websocket: WebSocket,
+        agent_spec: AgentSpec,
+        env: AgentEnv,
+        call_request: Optional[CallRequest] = None,
+    ):
         """
         Initialize the ConversationRunner.
 
@@ -280,9 +320,11 @@ class ConversationRunner:
             websocket: The WebSocket connection.
             agent_spec: Agent or (Agent, run_filter, cancel_filter).
             env: Environment passed to the agent.
+            call_request: The call request with telephony params.
         """
         self.websocket = websocket
         self.env = env
+        self.call_request = call_request
         self.shutdown_event = asyncio.Event()
         self.history: List[InputEvent] = []
         self.emitted_agent_text: List[Tuple[str, bool]] = []  # (content, interruptible)
@@ -347,7 +389,21 @@ class ConversationRunner:
         Processes incoming websocket messages until shutdown.
         """
         # Emit call_started to seed history/context
-        start_event, self.history = self._process_input_event(self.history, CallStarted())
+        call_context = None
+        if self.call_request:
+            call_context = CallContext(
+                call_id=self.call_request.call_id,
+                from_=self.call_request.from_,
+                to=self.call_request.to,
+                direction=self.call_request.direction,
+                call_sid=self.call_request.call_sid,
+                agent_call_id=self.call_request.agent_call_id,
+                metadata=self.call_request.metadata or {},
+                extra=self.call_request.extra,
+            )
+        start_event, self.history = self._process_input_event(
+            self.history, CallStarted(call_context=call_context)
+        )
         await self._handle_event(TurnEnv(), start_event)
 
         while not self.shutdown_event.is_set():

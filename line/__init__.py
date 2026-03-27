@@ -25,6 +25,7 @@ from line.events import (
     AgentTurnEnded,
     AgentTurnStarted,
     AgentUpdateCall,
+    CallContext,
     CallEnded,
     # Input events
     CallStarted,
@@ -57,6 +58,7 @@ __all__ = [
     "ConversationRunner",
     "AgentEnv",
     "CallRequest",
+    "CallContext",
     "AgentConfig",
     "PreCallResult",
     # Agent types
