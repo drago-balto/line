@@ -1,0 +1,11 @@
+[project]
+name = "end-call-after-speech"
+version = "0.1.0"
+description = "Example demonstrating after_speech flag on end_call"
+requires-python = ">=3.10"
+dependencies = [
+    "cartesia-line==0.2.7",
+]
+
+[tool.setuptools]
+py-modules = ["main"]
