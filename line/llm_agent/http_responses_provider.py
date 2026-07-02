@@ -277,6 +277,45 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Debug: log the context actually sent on the wire
+# ---------------------------------------------------------------------------
+
+
+def _summarize_wire_input(request_kwargs: Dict[str, Any], last_n: int = 10) -> str:
+    """Render the last ``last_n`` items of the Responses ``input`` for logging.
+
+    ``input`` is the payload actually sent to the model on this request. In ZDR
+    mode it is the full conversation; in continuation mode it is only the delta
+    since ``previous_response_id`` (noted in the header). Text is truncated so
+    logs stay readable.
+    """
+    items: List[Any] = request_kwargs.get("input") or []
+    prev = request_kwargs.get("previous_response_id")
+    lines: List[str] = []
+    for item in items[-last_n:]:
+        if not isinstance(item, dict):
+            lines.append(f"  {str(item)[:300]}")
+            continue
+        itype = item.get("type")
+        if itype == "message":
+            role = item.get("role", "?")
+            text = "".join(p.get("text", "") for p in (item.get("content") or []) if isinstance(p, dict))
+            lines.append(f"  [{role}] {text[:300]!r}")
+        elif itype == "function_call":
+            args = str(item.get("arguments"))[:200]
+            lines.append(f"  [tool_call] {item.get('name')}({args})")
+        elif itype == "function_call_output":
+            lines.append(f"  [tool_result] {str(item.get('output'))[:300]!r}")
+        else:
+            lines.append(f"  [{itype}] {str(item)[:300]}")
+    header = (
+        f"last {min(last_n, len(items))} of {len(items)} input items; "
+        f"previous_response_id={'set' if prev else 'none'}"
+    )
+    return header + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # _HttpResponsesProvider
 # ---------------------------------------------------------------------------
 
@@ -344,6 +383,13 @@ class _HttpResponsesProvider:
                             request_kwargs["api_key"] = self._api_key
                         if config.timeout:
                             request_kwargs["timeout"] = config.timeout
+
+                        # DEBUG: log the tail of the context actually sent on
+                        # the wire, to diagnose what the model sees per request.
+                        logger.info(
+                            "Responses HTTP wire context:\n{ctx}",
+                            ctx=_summarize_wire_input(request_kwargs),
+                        )
 
                         iterator = await aresponses(**request_kwargs)
 
