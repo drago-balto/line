@@ -10,6 +10,79 @@ from line.voice_agent_app import CallRequest
 _UNSET: Any = object()
 
 
+# Default detection pattern for SpeechGuardConfig. Two alternatives, both safe
+# to search mid-text (natural TTS speech contains neither):
+#   - ``{\s*"``            — a JSON object opening onto a quoted key
+#   - ``ident\s*(\s*[{"]`` — a snake_case identifier called with a JSON/str
+#     arg, e.g. ``record_call_summary({``. Requiring ``{`` or ``"`` right after
+#     the paren keeps spoken oddities like ``name(at)domain`` from matching.
+DEFAULT_SPEECH_LEAK_PATTERN = r'\{\s*"|[a-z_][a-z0-9_]*\s*\(\s*[{"]'
+
+DEFAULT_SPEECH_LEAK_RETRY_NOTE = (
+    "Your previous reply was discarded: it wrote a tool call (JSON arguments "
+    "or a function-call expression) into the spoken message text. Tool calls "
+    "must be made ONLY through the function-calling channel; the spoken "
+    "message must contain only natural language for the caller (or nothing). "
+    "Produce your reply again now: make any tool calls properly, and never "
+    "include JSON, braces, field names, or tool syntax in the spoken text."
+)
+
+DEFAULT_SPEECH_LEAK_BRIDGE_TEXT = "Sorry, I'm having some technical issues. Let me try that again."
+
+DEFAULT_SPEECH_LEAK_FALLBACK_TEXT = (
+    "I'm sorry, I'm having some technical difficulties right now. Would you like me to try again?"
+)
+
+
+@dataclass
+class SpeechGuardConfig:
+    """Guard spoken text against tool-call payloads leaking into TTS.
+
+    Some reasoning models (observed: ``gpt-5.4-mini``) occasionally write a
+    tool call's JSON arguments — or the whole call expression,
+    ``record_call_summary({...})`` — into a user-visible ``message`` item
+    instead of (or in addition to) the proper ``function_call`` item. Without
+    a guard the caller hears raw JSON read out loud.
+
+    When enabled, the ``http_responses`` provider buffers each spoken message
+    item with ``lookahead_chars`` of holdback and scans the accumulated text
+    for ``detection_pattern`` (``re.search``, so a leak is caught anywhere in
+    the item, not just at its head). On a hit the current LLM invocation is
+    aborted before any of its tool calls execute or its output is committed
+    to history, and the whole invocation is retried up to ``max_retries``
+    times with ``retry_note`` injected (via ``retry_note_channel``) and an
+    optional ``retry_reasoning_effort`` override to decorrelate the retry
+    from the failed attempt. If the caller already heard part of the failed
+    attempt, ``bridge_text`` is spoken before the retry; if every attempt
+    leaks, ``fallback_text`` is spoken and the turn ends with no tool calls.
+
+    Off by default; enable per agent/model. Only the ``http_responses``
+    backend reads it.
+    """
+
+    enabled: bool = False
+    # Which message-item phases are guarded. Leaks have only been observed on
+    # ``commentary`` items; add ``"final_answer"`` to guard those too.
+    phases: frozenset = frozenset({"commentary"})
+    # Chars of holdback between what has streamed in and what is released to
+    # TTS. Must comfortably exceed the longest prefix of ``detection_pattern``
+    # that can look natural (tool name + ``({``), so a leak is always caught
+    # before any of it is released.
+    lookahead_chars: int = 64
+    detection_pattern: str = DEFAULT_SPEECH_LEAK_PATTERN
+    max_retries: int = 1
+    retry_note: str = DEFAULT_SPEECH_LEAK_RETRY_NOTE
+    # "developer": append a developer-role input item (privileged, most
+    # recent instruction). "instructions": append to the system instructions
+    # for the retry request only.
+    retry_note_channel: Literal["developer", "instructions"] = "developer"
+    # Reasoning effort override for retry requests (e.g. "medium" when the
+    # base config runs "minimal"). None keeps the original effort.
+    retry_reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
+    bridge_text: str = DEFAULT_SPEECH_LEAK_BRIDGE_TEXT
+    fallback_text: str = DEFAULT_SPEECH_LEAK_FALLBACK_TEXT
+
+
 @dataclass
 class LlmConfig:
     """
@@ -57,6 +130,10 @@ class LlmConfig:
     # on every turn. Only used by the WebSocket and ``http_responses``
     # backends; the ``http`` backend ignores it.
     zdr_enabled: bool = _UNSET
+
+    # Spoken-text tool-call-leak guard (http_responses backend only).
+    # None = disabled. See :class:`SpeechGuardConfig`.
+    speech_guard: Optional[SpeechGuardConfig] = _UNSET
 
     @classmethod
     def from_call_request(
@@ -145,6 +222,7 @@ _FIELD_DEFAULTS: Dict[str, Any] = {
     "extra": dict,  # callable → invoked each time
     "strict_tool_schemas": True,
     "zdr_enabled": False,
+    "speech_guard": None,
 }
 
 
