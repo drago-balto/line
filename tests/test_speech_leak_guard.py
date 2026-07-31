@@ -475,3 +475,112 @@ def test_chat_without_guard_streams_leak_as_before(monkeypatch):
 
     assert "".join(c.text for c in chunks if c.text) == leak_text
     assert len(fake.requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# Degraded harmony-header leak shapes (no paren, no leading brace) — observed
+# in production replay sampling and in live call ac_CAd1ea4a… follow-up runs:
+# the tool-call header corrupts into visible text as tool name + glitch-token
+# run + `json {…`, sometimes with `to=functions.…` / `functions.…` markers.
+# ---------------------------------------------------------------------------
+
+_GLITCH_HEADER_LEAK_DELTAS = [
+    "record",
+    "_call",
+    "_summary",
+    "  彩",
+    "神争",
+    "霸大发",
+    "json",
+    ' {"',
+    "summary",
+    '":"',
+    "Caller",
+    " asked",
+    " for",
+    " a",
+    " repeat",
+    '."}',
+]
+
+_TO_FUNCTIONS_LEAK_DELTAS = [
+    "record",
+    "_call",
+    "_summary",
+    " to",
+    "=functions",
+    ".record",
+    "_call",
+    "_summary",
+    "  天天中",
+    "彩票出票",
+    "json",
+    ' {"summary":"x"}',
+]
+
+
+def test_glitch_header_leak_detected_with_nothing_released():
+    """Tool name + glitch tokens + `json {"` — no paren, no leading brace.
+    Detection lands on the JSON-object alternative at offset ~30; the default
+    128-char holdback must keep every character inaudible (with the previous
+    64-char default and a longer glitch run, 3 chars escaped in production)."""
+    guard = SpeechGuardConfig(enabled=True)
+
+    async def drive():
+        return await _drive(_leak_events(_GLITCH_HEADER_LEAK_DELTAS), guard)
+
+    with pytest.raises(_SpeechLeakDetected) as exc_info:
+        _run(drive())
+    leak = exc_info.value
+    assert leak.released_any is False
+    assert leak.released_chars == 0
+
+
+def test_to_functions_marker_detected_before_json_arrives():
+    """The `to=functions.` recipient marker is pure protocol syntax and fires
+    on its own — detection must not have to wait for the `{"` payload."""
+    guard = SpeechGuardConfig(enabled=True)
+    # Only the deltas up to and including the marker (`to=functions.`);
+    # no JSON ever arrives.
+    deltas = _TO_FUNCTIONS_LEAK_DELTAS[:6]
+
+    async def drive():
+        return await _drive(_leak_events(deltas), guard)
+
+    with pytest.raises(_SpeechLeakDetected) as exc_info:
+        _run(drive())
+    assert exc_info.value.released_chars == 0
+
+
+def test_functions_namespace_prefix_detected():
+    guard = SpeechGuardConfig(enabled=True)
+
+    async def drive():
+        return await _drive(_leak_events(["functions", ".record_call", "_summary  xyz"]), guard)
+
+    with pytest.raises(_SpeechLeakDetected):
+        _run(drive())
+
+
+def test_harmony_special_token_delimiter_detected():
+    guard = SpeechGuardConfig(enabled=True)
+
+    async def drive():
+        return await _drive(_leak_events(["<|", "constrain|>json"]), guard)
+
+    with pytest.raises(_SpeechLeakDetected):
+        _run(drive())
+
+
+def test_prose_containing_functions_word_streams_clean():
+    """`functions` as an ordinary English word (followed by space or sentence
+    punctuation) must not trip the namespace-prefix alternative, and text
+    longer than the 128-char holdback still streams and flushes losslessly."""
+    guard = SpeechGuardConfig(enabled=True)
+    text = (
+        "Everything functions normally on your account. This tool functions. "
+        "Also, I want to make sure I have this right — is your property "
+        "address 35 North Green Bay Road, Lake Forest, IL 60045?"
+    )
+    chunks = _run(_drive(_message_events([text[:80], text[80:]]), guard))
+    assert "".join(c.text for c in chunks if c.text) == text

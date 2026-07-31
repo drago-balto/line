@@ -10,13 +10,31 @@ from line.voice_agent_app import CallRequest
 _UNSET: Any = object()
 
 
-# Default detection pattern for SpeechGuardConfig. Two alternatives, both safe
-# to search mid-text (natural TTS speech contains neither):
+# Default detection pattern for SpeechGuardConfig. Five alternatives, all safe
+# to search mid-text (natural TTS speech contains none of them):
 #   - ``{\s*"``            — a JSON object opening onto a quoted key
 #   - ``ident\s*(\s*[{"]`` — a snake_case identifier called with a JSON/str
 #     arg, e.g. ``record_call_summary({``. Requiring ``{`` or ``"`` right after
 #     the paren keeps spoken oddities like ``name(at)domain`` from matching.
-DEFAULT_SPEECH_LEAK_PATTERN = r'\{\s*"|[a-z_][a-z0-9_]*\s*\(\s*[{"]'
+#   - ``to=\w+\.``          — the harmony tool-call recipient marker
+#     (``to=functions.record_call_summary``); pure protocol syntax that
+#     survives header corruption and appears well before the JSON payload.
+#   - ``functions.<ident>``  — the harmony tool-namespace prefix glued to an
+#     identifier (no space after the dot, so prose like "it functions. Also"
+#     cannot match).
+#   - ``<|``                 — harmony special-token delimiters leaking
+#     literally (``<|constrain|>`` etc.); unambiguous non-speech.
+# The header-artifact alternatives matter for the observed degraded form
+# ``record_call_summary <glitch tokens> json {"summary":...`` where neither a
+# paren nor a leading ``{`` exists — they pull detection to (near) offset 0 so
+# nothing escapes the holdback window.
+DEFAULT_SPEECH_LEAK_PATTERN = (
+    r'\{\s*"'
+    r"|[a-z_][a-z0-9_]*\s*\(\s*[{\"]"
+    r"|to=\w+\."
+    r"|\bfunctions\.[a-z_]"
+    r"|<\|"
+)
 
 DEFAULT_SPEECH_LEAK_RETRY_NOTE = (
     "Your previous reply was discarded: it wrote a tool call (JSON arguments "
@@ -65,10 +83,14 @@ class SpeechGuardConfig:
     # ``commentary`` items; add ``"final_answer"`` to guard those too.
     phases: frozenset = frozenset({"commentary"})
     # Chars of holdback between what has streamed in and what is released to
-    # TTS. Must comfortably exceed the longest prefix of ``detection_pattern``
-    # that can look natural (tool name + ``({``), so a leak is always caught
-    # before any of it is released.
-    lookahead_chars: int = 64
+    # TTS. Must comfortably exceed the distance from a leak's start to its
+    # first pattern-matchable signature. The degraded-header form (tool name +
+    # unbounded glitch-token run + ``json {"``) put that signature at offset
+    # ~67 in production, so 64 let 3 chars slip out; 128 covers every shape
+    # observed so far. Cost is negligible: release lags generation (which far
+    # outpaces speech), and clean items shorter than the window are flushed
+    # whole the moment the item completes.
+    lookahead_chars: int = 128
     detection_pattern: str = DEFAULT_SPEECH_LEAK_PATTERN
     max_retries: int = 1
     retry_note: str = DEFAULT_SPEECH_LEAK_RETRY_NOTE
