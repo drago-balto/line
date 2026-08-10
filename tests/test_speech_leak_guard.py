@@ -24,7 +24,12 @@ from typing import Any, AsyncIterator, Dict, List
 from litellm.types.llms.base import BaseLiteLLMOpenAIResponseObject
 import pytest
 
-from line.llm_agent.config import LlmConfig, SpeechGuardConfig, _normalize_config
+from line.llm_agent.config import (
+    DEFAULT_SPEECH_LEAK_FALLBACK_TEXT,
+    LlmConfig,
+    SpeechGuardConfig,
+    _normalize_config,
+)
 from line.llm_agent.http_responses_provider import (
     _HttpResponseEventStream,
     _HttpResponsesProvider,
@@ -475,6 +480,69 @@ def test_chat_without_guard_streams_leak_as_before(monkeypatch):
 
     assert "".join(c.text for c in chunks if c.text) == leak_text
     assert len(fake.requests) == 1
+
+
+def test_chat_callable_texts_resolved_at_speak_time(monkeypatch):
+    """bridge_text / fallback_text may be zero-arg callables (multilingual
+    agents pick the line by current language at speak time, not config time)."""
+    lines_spoken: List[str] = []
+
+    def bridge() -> str:
+        lines_spoken.append("bridge")
+        return "Un instant, je reprends."
+
+    def fallback() -> str:
+        lines_spoken.append("fallback")
+        return "Désolé, un souci technique. Voulez-vous que je réessaie ?"
+
+    guard = SpeechGuardConfig(enabled=True, lookahead_chars=16, bridge_text=bridge, fallback_text=fallback)
+    prefix = "Merci de patienter, j'ai tout ce qu'il me faut. "
+    fake = _FakeAresponses(
+        [
+            _leak_events([prefix, '{"summary": "x"}']),  # heard prefix → bridge
+            _leak_events(_BARE_JSON_LEAK_DELTAS),  # leaks again → fallback
+        ]
+    )
+    monkeypatch.setattr("line.llm_agent.http_responses_provider.aresponses", fake)
+    provider, config = _make_provider_and_config(guard)
+
+    chunks = _run(_collect_chat(provider, config))
+
+    texts = [c.text for c in chunks if c.text]
+    assert "Un instant, je reprends." in texts
+    assert texts[-1] == "Désolé, un souci technique. Voulez-vous que je réessaie ?"
+    assert lines_spoken == ["bridge", "fallback"]  # each invoked exactly once, on demand
+
+
+def test_chat_callable_text_returning_empty_speaks_nothing(monkeypatch):
+    guard = SpeechGuardConfig(enabled=True, fallback_text=lambda: "")
+    fake = _FakeAresponses([_leak_events(_BARE_JSON_LEAK_DELTAS), _leak_events(_BARE_JSON_LEAK_DELTAS)])
+    monkeypatch.setattr("line.llm_agent.http_responses_provider.aresponses", fake)
+    provider, config = _make_provider_and_config(guard)
+
+    chunks = _run(_collect_chat(provider, config))
+
+    assert [c.text for c in chunks if c.text] == []
+    assert chunks[-1].is_final is True
+
+
+def test_chat_crashing_text_callable_falls_back_to_default(monkeypatch):
+    """A raising callable must not take down leak recovery: the English
+    default line is spoken and the turn still ends cleanly."""
+
+    def boom() -> str:
+        raise RuntimeError("translation service down")
+
+    guard = SpeechGuardConfig(enabled=True, max_retries=0, fallback_text=boom)
+    fake = _FakeAresponses([_leak_events(_BARE_JSON_LEAK_DELTAS)])
+    monkeypatch.setattr("line.llm_agent.http_responses_provider.aresponses", fake)
+    provider, config = _make_provider_and_config(guard)
+
+    chunks = _run(_collect_chat(provider, config))
+
+    texts = [c.text for c in chunks if c.text]
+    assert texts == [DEFAULT_SPEECH_LEAK_FALLBACK_TEXT]
+    assert chunks[-1].is_final is True
 
 
 # ---------------------------------------------------------------------------

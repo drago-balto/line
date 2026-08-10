@@ -2,7 +2,7 @@
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Union
 
 from line.voice_agent_app import CallRequest
 
@@ -74,6 +74,15 @@ class SpeechGuardConfig:
     attempt, ``bridge_text`` is spoken before the retry; if every attempt
     leaks, ``fallback_text`` is spoken and the turn ends with no tool calls.
 
+    ``bridge_text`` and ``fallback_text`` are caller-audible, so they may be
+    given as zero-arg callables instead of strings for agents whose spoken
+    language isn't fixed at config time: the callable is invoked at speak
+    time (each time it is needed) and returns the line to speak — return
+    ``""`` to speak nothing. If the callable raises, the English default is
+    spoken and the error logged; leak recovery must not crash. ``retry_note``
+    stays a plain string — it is model-facing, and models follow English
+    instructions regardless of the conversation language.
+
     Off by default; enable per agent/model. Only the ``http_responses``
     backend reads it.
     """
@@ -81,7 +90,7 @@ class SpeechGuardConfig:
     enabled: bool = False
     # Which message-item phases are guarded. Leaks have only been observed on
     # ``commentary`` items; add ``"final_answer"`` to guard those too.
-    phases: frozenset = frozenset({"commentary"})
+    phases: FrozenSet[str] = frozenset({"commentary"})
     # Chars of holdback between what has streamed in and what is released to
     # TTS. Must comfortably exceed the distance from a leak's start to its
     # first pattern-matchable signature. The degraded-header form (tool name +
@@ -101,8 +110,8 @@ class SpeechGuardConfig:
     # Reasoning effort override for retry requests (e.g. "medium" when the
     # base config runs "minimal"). None keeps the original effort.
     retry_reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
-    bridge_text: str = DEFAULT_SPEECH_LEAK_BRIDGE_TEXT
-    fallback_text: str = DEFAULT_SPEECH_LEAK_FALLBACK_TEXT
+    bridge_text: Union[str, Callable[[], str]] = DEFAULT_SPEECH_LEAK_BRIDGE_TEXT
+    fallback_text: Union[str, Callable[[], str]] = DEFAULT_SPEECH_LEAK_FALLBACK_TEXT
 
 
 @dataclass

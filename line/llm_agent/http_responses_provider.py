@@ -68,7 +68,12 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from litellm import aresponses
 from loguru import logger
 
-from line.llm_agent.config import LlmConfig, SpeechGuardConfig
+from line.llm_agent.config import (
+    DEFAULT_SPEECH_LEAK_BRIDGE_TEXT,
+    DEFAULT_SPEECH_LEAK_FALLBACK_TEXT,
+    LlmConfig,
+    SpeechGuardConfig,
+)
 from line.llm_agent.provider import Message, ParsedModelId, StreamChunk, ToolCall
 from line.llm_agent.provider_utils import (
     ConversationEntry,
@@ -419,6 +424,23 @@ def _apply_speech_leak_retry(body: Dict[str, Any], guard: SpeechGuardConfig) -> 
         body["reasoning"] = {"effort": guard.retry_reasoning_effort}
 
 
+def _resolve_guard_text(value: Any, *, default: str, what: str) -> str:
+    """Resolve a guard text field that may be a zero-arg callable.
+
+    Callables support language-dynamic agents: the line to speak is computed
+    at speak time, not frozen at config time. A raising callable must not
+    take down leak recovery, so on error the English ``default`` is spoken
+    and the exception logged.
+    """
+    if not callable(value):
+        return value
+    try:
+        return value()
+    except Exception:
+        logger.exception("Speech-leak guard: {w} callable raised; speaking the default line", w=what)
+        return default
+
+
 async def _close_stream_iterator(iterator: Any) -> None:
     """Best-effort early abort of a litellm ``aresponses`` stream.
 
@@ -545,8 +567,13 @@ class _HttpResponsesProvider:
                             n=leak_attempts,
                             s=leak.suppressed_chars,
                         )
-                        if guard.fallback_text:
-                            yield StreamChunk(text=guard.fallback_text)
+                        fallback = _resolve_guard_text(
+                            guard.fallback_text,
+                            default=DEFAULT_SPEECH_LEAK_FALLBACK_TEXT,
+                            what="fallback_text",
+                        )
+                        if fallback:
+                            yield StreamChunk(text=fallback)
                         yield StreamChunk(tool_calls=[], is_final=True)
                         return
                     leak_attempts += 1
@@ -560,8 +587,14 @@ class _HttpResponsesProvider:
                         e=guard.retry_reasoning_effort or "(unchanged)",
                         h=leak.released_any,
                     )
-                    if leak.released_any and guard.bridge_text:
-                        yield StreamChunk(text=guard.bridge_text)
+                    if leak.released_any:
+                        bridge = _resolve_guard_text(
+                            guard.bridge_text,
+                            default=DEFAULT_SPEECH_LEAK_BRIDGE_TEXT,
+                            what="bridge_text",
+                        )
+                        if bridge:
+                            yield StreamChunk(text=bridge)
                 except RuntimeError as exc:
                     if "previous_response_not_found" not in str(exc) or emitted_any or attempt >= 1:
                         raise
