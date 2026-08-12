@@ -91,6 +91,22 @@ _TERMINAL_EVENTS = frozenset(
     }
 )
 
+# PHASE EXPERIMENT (speech-leak-guard-test branch): sentinels distinguishing
+# the ways a phase can be absent. "attr missing" = the message item object had
+# no ``phase`` attribute; "never registered" = no output_item.added was seen
+# for that output_index at all.
+_PHASE_ATTR_MISSING: Any = object()
+_PHASE_NEVER_REGISTERED: Any = object()
+
+
+def _describe_phase(raw: Any) -> str:
+    """Render a raw phase observation unambiguously for the experiment logs."""
+    if raw is _PHASE_ATTR_MISSING:
+        return "<attr-missing>"
+    if raw is _PHASE_NEVER_REGISTERED:
+        return "<item-never-registered>"
+    return repr(raw)  # repr distinguishes None / '' / 'commentary'
+
 
 class _SpeechLeakDetected(Exception):
     """A guarded message item matched the speech-leak detection pattern.
@@ -158,6 +174,12 @@ class _HttpResponseEventStream:
         # decision below is phase-blind — first textual message item in a
         # response wins; subsequent textual items are dropped.
         message_phases: Dict[int, str] = {}
+        # PHASE EXPERIMENT (speech-leak-guard-test branch): raw ``phase``
+        # values as they arrived on output_item.added, before the
+        # missing/empty -> "final_answer" coercion below, so real-call logs
+        # show what the API actually sent. _PHASE_ATTR_MISSING means the item
+        # had no ``phase`` attribute at all (distinct from an explicit None).
+        raw_phases: Dict[int, Any] = {}
         # output_index whose deltas are being streamed this response. Set on
         # the first non-empty delta of any message item.
         streaming_index: Optional[int] = None
@@ -183,8 +205,18 @@ class _HttpResponseEventStream:
                 output_index = event.output_index
                 item_type = item.type
                 if item_type == "message":
-                    phase = getattr(item, "phase", None) or "final_answer"
+                    raw_phase = getattr(item, "phase", _PHASE_ATTR_MISSING)
+                    raw_phases[int(output_index)] = raw_phase
+                    phase = (None if raw_phase is _PHASE_ATTR_MISSING else raw_phase) or "final_answer"
                     message_phases[int(output_index)] = phase
+                    logger.info(
+                        "PHASE EXPERIMENT: output_item.added message output_index={i} "
+                        "item_id={id} raw_phase={raw} coerced_phase={p}",
+                        i=output_index,
+                        id=getattr(item, "id", None),
+                        raw=_describe_phase(raw_phase),
+                        p=phase,
+                    )
                 elif item_type == "function_call":
                     call_id = item.call_id
                     name = item.name
@@ -200,9 +232,12 @@ class _HttpResponseEventStream:
                     streaming_index = output_index
                     phase = message_phases.get(output_index, "(unknown)")
                     guard_active = self._guard is not None and phase in self._guard.phases
-                    logger.debug(
-                        "Responses HTTP: streaming text from output_index={i} phase={p} guarded={g}",
+                    logger.info(
+                        "PHASE EXPERIMENT: streaming claim output_index={i} registered={reg} "
+                        "raw_phase={raw} coerced_phase={p} guarded={g}",
                         i=output_index,
+                        reg=output_index in message_phases,
+                        raw=_describe_phase(raw_phases.get(output_index, _PHASE_NEVER_REGISTERED)),
                         p=phase,
                         g=guard_active,
                     )
@@ -247,10 +282,11 @@ class _HttpResponseEventStream:
                     # often emits commentary + final_answer with identical
                     # text) and respects "one reply per turn".
                     dropped_indices_logged.add(output_index)
-                    logger.debug(
-                        "Responses HTTP: dropping text from output_index={i} phase={p} "
-                        "(already streaming output_index={s} phase={sp})",
+                    logger.info(
+                        "PHASE EXPERIMENT: dropping text from output_index={i} raw_phase={raw} "
+                        "coerced_phase={p} (already streaming output_index={s} phase={sp})",
                         i=output_index,
+                        raw=_describe_phase(raw_phases.get(output_index, _PHASE_NEVER_REGISTERED)),
                         p=message_phases.get(output_index, "(unknown)"),
                         s=streaming_index,
                         sp=message_phases.get(streaming_index, "(unknown)"),
@@ -275,6 +311,18 @@ class _HttpResponseEventStream:
 
             elif event_type == "response.output_item.done":
                 item = event.item
+                if item.type == "message":
+                    done_idx = int(getattr(event, "output_index", -1))
+                    done_raw = getattr(item, "phase", _PHASE_ATTR_MISSING)
+                    added_raw = raw_phases.get(done_idx, _PHASE_NEVER_REGISTERED)
+                    logger.info(
+                        "PHASE EXPERIMENT: output_item.done message output_index={i} "
+                        "raw_phase={raw} added_raw_phase={araw} agrees={ok}",
+                        i=done_idx,
+                        raw=_describe_phase(done_raw),
+                        araw=_describe_phase(added_raw),
+                        ok=done_raw == added_raw,
+                    )
                 if (
                     item.type == "message"
                     and guard_active
